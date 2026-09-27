@@ -11,21 +11,25 @@ import { fileURLToPath } from "node:url";
 
 const exec = promisify(execFile);
 const extensionPath = fileURLToPath(import.meta.url);
-const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
-const text = (content: { type: string; text?: string }[]) => content.filter((part) => part.type === "text").map((part) => part.text ?? "").join("\n");
+const shellQuote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
+const assistantText = (content: { type: string; text?: string }[]) => content.filter((part) => part.type === "text").map((part) => part.text ?? "").join("\n");
 
 function argsForChild(args: string[]): string[] {
+  const valueOptions = new Set(["--model", "--provider", "--api-key", "--system-prompt", "--append-system-prompt", "--name", "-n", "--models", "--tools", "-t", "--exclude-tools", "-xt", "--thinking", "--extension", "-e", "--skill", "--prompt-template", "--theme", "--use-theme", "--session-dir"]);
+  const incompatible = new Set(["--print", "-p", "--continue", "-c", "--resume", "-r", "--session", "--session-id", "--fork", "--mode", "--export", "--list-models", "--help", "-h", "--version", "-v", "--"]);
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-    if (["--print", "-p", "--continue", "-c", "--resume", "-r", "--"].includes(arg) || arg.startsWith("--mode") || arg.startsWith("--session") || arg === "--fork") {
+    if (incompatible.has(arg) || [...incompatible].some((flag) => flag.startsWith("--") && arg.startsWith(`${flag}=`))) {
       throw new Error(`${arg} is incompatible with a fresh interactive subagent`);
     }
     if (arg === "--tui-mode") {
       if (args[++i] !== "regular") throw new Error("subagent requires --tui-mode regular");
     } else if (arg.startsWith("--tui-mode=")) {
       if (arg !== "--tui-mode=regular") throw new Error("subagent requires --tui-mode regular");
-    } else if (arg.startsWith("-p") && arg !== "-provider") {
-      throw new Error(`${arg} is incompatible with an interactive subagent`);
+    } else if (valueOptions.has(arg)) {
+      if (++i >= args.length) throw new Error(`${arg} requires a value`);
+    } else if (!arg.startsWith("-")) {
+      throw new Error(`piArgs must contain options, not a prompt: ${arg}`);
     }
   }
   return args.some((arg) => arg === "--tui-mode" || arg === "--tui-mode=regular") ? args : [...args, "--tui-mode", "regular"];
@@ -40,7 +44,7 @@ function reportChild(pi: ExtensionAPI) {
     let answer = "子任务失败：没有最终回答。";
     if (last?.type === "message" && last.message.role === "assistant") {
       const message = last.message;
-      answer = message.stopReason === "aborted" ? "子任务已中断。" : message.stopReason === "error" ? `子任务失败：${message.errorMessage ?? "模型调用失败"}` : text(message.content);
+      answer = message.stopReason === "aborted" ? "子任务已中断。" : message.stopReason === "error" ? `子任务失败：${message.errorMessage ?? "模型调用失败"}` : assistantText(message.content);
     }
     try {
       await new Promise<void>((resolve, reject) => {
@@ -123,7 +127,7 @@ export default function subagent(pi: ExtensionAPI) {
       const session = `pi-subagents-${Date.now()}-${id.slice(0, 8)}`;
       tasks.set(id, token);
       const channel = `pi-subagent-ready-${id}`;
-      const command = `tmux wait-for ${quote(channel)}; exec pi ${[...args, "--extension", extensionPath, "--", params.task].map(quote).join(" ")}`;
+      const command = `tmux wait-for ${shellQuote(channel)}; exec pi ${[...args, "--extension", extensionPath, "--", params.task].map(shellQuote).join(" ")}`;
       try {
         await exec("tmux", ["new-session", "-d", "-s", session, "-c", cwd,
           "-e", `PI_SUBAGENT_ID=${id}`, "-e", `PI_SUBAGENT_TOKEN=${token}`, "-e", `PI_SUBAGENT_SOCKET=${socketPath}`, command]);

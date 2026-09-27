@@ -38,6 +38,9 @@ test("rejects incompatible interactive options before creating a tmux session", 
   const h = harness();
   await expect(h.execute({ task: "hi", piArgs: ["--tui-mode=fullscreen"] })).rejects.toThrow(/regular/);
   await expect(h.execute({ task: "hi", piArgs: ["--print"] })).rejects.toThrow(/interactive/);
+  for (const flag of ["--export", "--list-models", "--help", "--version", "--mode=json"]) {
+    await expect(h.execute({ task: "hi", piArgs: [flag] })).rejects.toThrow(/interactive/);
+  }
   await h.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, h.ctx);
 });
 
@@ -65,9 +68,12 @@ test("delivers separate results only to the original session and ignores invalid
   await report({ id: a.id, token: tokenA, text: "first" });
   expect(h.sendMessage.mock.calls.map(([msg]) => msg.content)).toEqual([expect.stringContaining("second"), expect.stringContaining("first")]);
   expect(h.sendMessage.mock.calls.every(([, options]) => options.triggerTurn && options.deliverAs === "followUp")).toBe(true);
+  const pending = await h.execute({ task: "Answer 3", piArgs: [] });
+  const c = pending.details as typeof a;
+  const tokenC = env(c.session, "PI_SUBAGENT_TOKEN");
   h.setSession("another");
-  await report({ id: a.id, token: tokenA, text: "late" });
+  await report({ id: c.id, token: tokenC, text: "must not be delivered" });
   expect(h.sendMessage).toHaveBeenCalledTimes(2);
   await h.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, h.ctx);
-  for (const session of [a.session, b.session]) execFileSync("tmux", ["kill-session", "-t", session]);
+  for (const session of [a.session, b.session, c.session]) execFileSync("tmux", ["kill-session", "-t", session]);
 });
