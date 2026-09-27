@@ -1,17 +1,22 @@
 {
-  "name": "tmux-pi-subagent",
+  "name": "pi-tmux-subagents",
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "pi": {
+    "extensions": ["./src/subagent.ts"]
+  },
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
-  "dependencies": {
-    "@earendil-works/pi-ai": "0.87.1",
-    "@earendil-works/pi-coding-agent": "0.87.1"
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "0.87.1",
+    "@earendil-works/pi-coding-agent": "0.87.1",
     "@types/node": "^26.6.3",
     "typescript": "^7.0.2",
     "vitest": "^5.0.2"
