@@ -1,0 +1,145 @@
+import { Type } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { createServer, connect, type Server } from "node:net";
+import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const exec = promisify(execFile);
+const extensionPath = fileURLToPath(import.meta.url);
+const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
+const text = (content: { type: string; text?: string }[]) => content.filter((part) => part.type === "text").map((part) => part.text ?? "").join("\n");
+
+function argsForChild(args: string[]): string[] {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (["--print", "-p", "--continue", "-c", "--resume", "-r", "--"].includes(arg) || arg.startsWith("--mode") || arg.startsWith("--session") || arg === "--fork") {
+      throw new Error(`${arg} is incompatible with a fresh interactive subagent`);
+    }
+    if (arg === "--tui-mode") {
+      if (args[++i] !== "regular") throw new Error("subagent requires --tui-mode regular");
+    } else if (arg.startsWith("--tui-mode=")) {
+      if (arg !== "--tui-mode=regular") throw new Error("subagent requires --tui-mode regular");
+    } else if (arg.startsWith("-p") && arg !== "-provider") {
+      throw new Error(`${arg} is incompatible with an interactive subagent`);
+    }
+  }
+  return args.some((arg) => arg === "--tui-mode" || arg === "--tui-mode=regular") ? args : [...args, "--tui-mode", "regular"];
+}
+
+function reportChild(pi: ExtensionAPI) {
+  let reported = false;
+  pi.on("agent_settled", async (_event, ctx) => {
+    if (reported) return;
+    reported = true;
+    const last = ctx.sessionManager.buildContextEntries().reverse().find((entry) => entry.type === "message" && entry.message.role === "assistant");
+    let answer = "子任务失败：没有最终回答。";
+    if (last?.type === "message" && last.message.role === "assistant") {
+      const message = last.message;
+      answer = message.stopReason === "aborted" ? "子任务已中断。" : message.stopReason === "error" ? `子任务失败：${message.errorMessage ?? "模型调用失败"}` : text(message.content);
+    }
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const socket = connect(process.env.PI_SUBAGENT_SOCKET!);
+        socket.setTimeout(3000, () => socket.destroy(new Error("report timeout")));
+        socket.on("error", reject);
+        socket.on("close", () => resolve());
+        socket.on("connect", () => socket.end(JSON.stringify({ id: process.env.PI_SUBAGENT_ID, token: process.env.PI_SUBAGENT_TOKEN, text: answer }) + "\n"));
+      });
+    } catch { /* Parent may have left; tmux retains the pane. */ }
+    ctx.shutdown();
+  });
+}
+
+export default function subagent(pi: ExtensionAPI) {
+  if (process.env.PI_SUBAGENT_ID) {
+    reportChild(pi);
+    return;
+  }
+
+  let server: Server | undefined;
+  let socketDir: string | undefined;
+  let owner: string | undefined;
+  const tasks = new Map<string, string>();
+  const close = () => {
+    server?.close();
+    server = undefined;
+    tasks.clear();
+    owner = undefined;
+    if (socketDir) rmSync(socketDir, { recursive: true, force: true });
+    socketDir = undefined;
+  };
+  pi.on("session_shutdown", close);
+
+  async function listen(ctx: ExtensionContext) {
+    if (server) return;
+    owner = ctx.sessionManager.getSessionId();
+    socketDir = mkdtempSync(join(tmpdir(), "pi-subagent-"));
+    const socketPath = join(socketDir, "reply.sock");
+    server = createServer((connection) => {
+      let body = "";
+      connection.on("data", (chunk: Buffer) => {
+        body += chunk.toString();
+        if (body.length > 1024 * 1024) connection.destroy();
+      });
+      connection.on("end", () => {
+        try {
+          const { id, token, text: result } = JSON.parse(body);
+          if (typeof id !== "string" || typeof result !== "string" || !tasks.has(id) || tasks.get(id) !== token || ctx.sessionManager.getSessionId() !== owner) return;
+          tasks.delete(id);
+          pi.sendMessage({ customType: "subagent-result", content: `子任务 ${id} 的结果：\n${result}`, display: true }, { triggerTurn: true, deliverAs: "followUp" });
+        } catch { /* Ignore malformed messages. */ }
+      });
+    });
+    try {
+      await new Promise<void>((resolve, reject) => server!.once("error", reject).listen(socketPath, resolve));
+    } catch (error) {
+      close();
+      throw error;
+    }
+    return socketPath;
+  }
+
+  pi.registerTool({
+    name: "subagent",
+    label: "Subagent",
+    description: "Start an independent interactive Pi in tmux. Returns immediately; the final answer is delivered later to this session. State read-only requirements and background in task. No recursive delegation.",
+    parameters: Type.Object({
+      task: Type.String({ description: "The complete task for the independent Pi" }),
+      piArgs: Type.Array(Type.String(), { description: "Pi CLI options (not a shell command)" }),
+      cwd: Type.Optional(Type.String({ description: "Working directory; defaults to this session's cwd" })),
+    }),
+    async execute(_id, params, _signal, _update, ctx) {
+      const args = argsForChild(params.piArgs);
+      const cwd = params.cwd ?? ctx.cwd;
+      if (!statSync(cwd).isDirectory()) throw new Error(`Not a directory: ${cwd}`);
+      const socketPath = (await listen(ctx)) ?? join(socketDir!, "reply.sock");
+      const id = randomUUID();
+      const token = randomUUID();
+      const session = `pi-subagents-${Date.now()}-${id.slice(0, 8)}`;
+      tasks.set(id, token);
+      const channel = `pi-subagent-ready-${id}`;
+      const command = `tmux wait-for ${quote(channel)}; exec pi ${[...args, "--extension", extensionPath, "--", params.task].map(quote).join(" ")}`;
+      try {
+        await exec("tmux", ["new-session", "-d", "-s", session, "-c", cwd,
+          "-e", `PI_SUBAGENT_ID=${id}`, "-e", `PI_SUBAGENT_TOKEN=${token}`, "-e", `PI_SUBAGENT_SOCKET=${socketPath}`, command]);
+        try {
+          await exec("tmux", ["set-option", "-w", "-t", session, "remain-on-exit", "on"]);
+        } finally {
+          await exec("tmux", ["wait-for", "-S", channel]);
+        }
+      } catch (error) {
+        tasks.delete(id);
+        throw error;
+      }
+      return {
+        content: [{ type: "text" as const, text: `Started ${id} in ${session}. Switch: tmux switch-client -t ${session}\nInspect: tmux capture-pane -p -S - -t ${session}\nClean up: tmux kill-session -t ${session}` }],
+        details: { id, session },
+      };
+    },
+  });
+}
