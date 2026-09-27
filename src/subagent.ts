@@ -11,12 +11,13 @@ import { fileURLToPath } from "node:url";
 
 const exec = promisify(execFile);
 const extensionPath = fileURLToPath(import.meta.url);
+const groupSession = "pi-tmux-subagents";
 const shellQuote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
 const assistantText = (content: { type: string; text?: string }[]) => content.filter((part) => part.type === "text").map((part) => part.text ?? "").join("\n");
 
 function argsForChild(args: string[]): string[] {
   const valueOptions = new Set(["--model", "--provider", "--api-key", "--system-prompt", "--append-system-prompt", "--name", "-n", "--models", "--tools", "-t", "--exclude-tools", "-xt", "--thinking", "--extension", "-e", "--skill", "--prompt-template", "--theme", "--use-theme", "--session-dir"]);
-  const incompatible = new Set(["--print", "-p", "--continue", "-c", "--resume", "-r", "--session", "--session-id", "--fork", "--mode", "--export", "--list-models", "--help", "-h", "--version", "-v", "--"]);
+  const incompatible = new Set(["--print", "-p", "--continue", "-c", "--resume", "-r", "--session", "--session-id", "--fork", "--mode", "--export", "--list-models", "--help", "-h", "--version", "-v", "--name", "-n", "--"]);
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (incompatible.has(arg) || [...incompatible].some((flag) => flag.startsWith("--") && arg.startsWith(`${flag}=`))) {
@@ -111,28 +112,45 @@ export default function subagent(pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
-    description: "Start an independent interactive Pi in tmux. Returns immediately; the final answer is delivered later to this session. State read-only requirements and background in task. No recursive delegation.",
+    description: "Start an independent interactive Pi in a window of the shared tmux session. Returns immediately; the final answer is delivered later. Supply a short title in the form project name｜specific work, using the task cwd for the project name. State read-only requirements and background in task. No recursive delegation.",
     parameters: Type.Object({
       task: Type.String({ description: "The complete task for the independent Pi" }),
+      title: Type.String({ description: "Short project name｜specific work, e.g. my-project｜investigate authentication; no generic labels or newlines" }),
       piArgs: Type.Array(Type.String(), { description: "Pi CLI options (not a shell command)" }),
       cwd: Type.Optional(Type.String({ description: "Working directory; defaults to this session's cwd" })),
     }),
     async execute(_id, params, _signal, _update, ctx) {
       const args = argsForChild(params.piArgs);
+      const title = params.title.trim();
+      if (!title || [...title].length > 80 || /[\x00-\x1f\x7f]/.test(title)) throw new Error("title must be 1–80 characters without control characters");
       const cwd = params.cwd ?? ctx.cwd;
       if (!statSync(cwd).isDirectory()) throw new Error(`Not a directory: ${cwd}`);
       const socketPath = (await listen(ctx)) ?? join(socketDir!, "reply.sock");
       const id = randomUUID();
       const token = randomUUID();
-      const session = `pi-subagents-${Date.now()}-${id.slice(0, 8)}`;
+      const session = groupSession;
       tasks.set(id, token);
       const channel = `pi-subagent-ready-${id}`;
-      const command = `tmux wait-for ${shellQuote(channel)}; exec pi ${[...args, "--extension", extensionPath, "--", params.task].map(shellQuote).join(" ")}`;
+      const command = `tmux wait-for ${shellQuote(channel)}; exec pi ${[...args, "--name", title, "--extension", extensionPath, "--", params.task].map(shellQuote).join(" ")}`;
+      const environment = ["-e", `PI_SUBAGENT_ID=${id}`, "-e", `PI_SUBAGENT_TOKEN=${token}`, "-e", `PI_SUBAGENT_SOCKET=${socketPath}`];
+      let windowId: string;
       try {
-        await exec("tmux", ["new-session", "-d", "-s", session, "-c", cwd,
-          "-e", `PI_SUBAGENT_ID=${id}`, "-e", `PI_SUBAGENT_TOKEN=${token}`, "-e", `PI_SUBAGENT_SOCKET=${socketPath}`, command]);
+        const createWindow = () => exec("tmux", ["new-window", "-d", "-P", "-F", "#{window_id}", "-t", `${session}:`, "-n", title, "-c", cwd, ...environment, command]);
+        if ((await exec("tmux", ["has-session", "-t", `=${session}`]).then(() => true, () => false))) {
+          windowId = (await createWindow()).stdout.trim();
+        } else {
+          try {
+            windowId = (await exec("tmux", ["new-session", "-d", "-P", "-F", "#{window_id}", "-s", session, "-n", title, "-c", cwd, ...environment, command])).stdout.trim();
+          } catch (error) {
+            // Another main Pi may have created the shared session concurrently.
+            await exec("tmux", ["has-session", "-t", `=${session}`]);
+            windowId = (await createWindow()).stdout.trim();
+          }
+        }
         try {
-          await exec("tmux", ["set-option", "-w", "-t", session, "remain-on-exit", "on"]);
+          await exec("tmux", ["set-option", "-w", "-t", windowId, "remain-on-exit", "on"]);
+          await exec("tmux", ["set-option", "-w", "-t", windowId, "automatic-rename", "off"]);
+          await exec("tmux", ["rename-window", "-t", windowId, title]);
         } finally {
           await exec("tmux", ["wait-for", "-S", channel]);
         }
@@ -141,8 +159,8 @@ export default function subagent(pi: ExtensionAPI) {
         throw error;
       }
       return {
-        content: [{ type: "text" as const, text: `Started ${id} in ${session}. Switch: tmux switch-client -t ${session}\nInspect: tmux capture-pane -p -S - -t ${session}\nClean up: tmux kill-session -t ${session}` }],
-        details: { id, session },
+        content: [{ type: "text" as const, text: `Started ${id} in ${session} window ${windowId} (${title}). Switch: tmux switch-client -t ${session} && tmux select-window -t ${windowId}\nInspect: tmux capture-pane -p -S - -t ${windowId}\nClean up: tmux kill-window -t ${windowId}` }],
+        details: { id, session, windowId },
       };
     },
   });

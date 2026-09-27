@@ -1,4 +1,4 @@
-import { afterEach, expect, test, vi } from "vitest";
+import { afterAll, afterEach, expect, test, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +6,15 @@ import { connect } from "node:net";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import extension from "../src/subagent.js";
 
+// Isolate the tmux server: tests must never remove a user's shared session.
+const previousTmux = process.env.TMUX;
+process.env.TMUX = join(tmpdir(), `tmux-${process.getuid!()}`, `subagent-test-${process.pid}-${Date.now()}`) + ",0,0";
+afterAll(async () => {
+  const { execFileSync } = await import("node:child_process");
+  try { execFileSync("tmux", ["kill-server"], { stdio: "ignore" }); } catch { /* No server if all calls were rejected. */ }
+  if (previousTmux === undefined) delete process.env.TMUX;
+  else process.env.TMUX = previousTmux;
+});
 const dirs: string[] = [];
 function harness() {
   const handlers = new Map<string, (event: any, ctx: ExtensionContext) => Promise<void> | void>();
@@ -38,24 +47,60 @@ test("rejects incompatible interactive options before creating a tmux session", 
   const h = harness();
   await expect(h.execute({ task: "hi", piArgs: ["--tui-mode=fullscreen"] })).rejects.toThrow(/regular/);
   await expect(h.execute({ task: "hi", piArgs: ["--print"] })).rejects.toThrow(/interactive/);
+  await expect(h.execute({ task: "hi", title: "project｜work", piArgs: ["--name", "other"] })).rejects.toThrow(/interactive/);
+  await expect(h.execute({ task: "hi", title: "project｜work", piArgs: ["--name=other"] })).rejects.toThrow(/interactive/);
+  await expect(h.execute({ task: "hi", title: "bad\ntitle", piArgs: [] })).rejects.toThrow(/title/);
   for (const flag of ["--export", "--list-models", "--help", "--version", "--mode=json"]) {
     await expect(h.execute({ task: "hi", piArgs: [flag] })).rejects.toThrow(/interactive/);
   }
   await h.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, h.ctx);
 });
 
-test("delivers separate results only to the original session and ignores invalid messages", async () => {
+test("groups concurrent tasks in one named session with stable window IDs and task titles", async () => {
   const h = harness();
-  // A launched task returns the socket coordinates through its tool details for observation.
-  const first = await h.execute({ task: "Answer 1", piArgs: [] });
-  const second = await h.execute({ task: "Answer 2", piArgs: [] });
-  const a = first.details as { id: string; session: string };
+  const [first, second] = await Promise.all([
+    h.execute({ task: "read auth", title: "project-a｜调查认证流程", piArgs: [] }),
+    h.execute({ task: "read queue", title: "project-b｜检查任务队列", piArgs: [] }),
+  ]);
+  const a = first.details as { session: string; windowId: string };
   const b = second.details as typeof a;
   const { execFileSync } = await import("node:child_process");
-  const env = (session: string, key: string) => execFileSync("tmux", ["show-environment", "-t", session, key], { encoding: "utf8" }).trim().slice(key.length + 1);
-  const socket = env(a.session, "PI_SUBAGENT_SOCKET");
-  const tokenA = env(a.session, "PI_SUBAGENT_TOKEN");
-  const tokenB = env(b.session, "PI_SUBAGENT_TOKEN");
+  try {
+    expect(a.session).toBe("pi-tmux-subagents");
+    expect(b.session).toBe(a.session);
+    expect(a.windowId).toMatch(/^@\d+$/);
+    expect(b.windowId).not.toBe(a.windowId);
+    const windowName = (id: string) => execFileSync("tmux", ["display-message", "-p", "-t", id, "#{window_name}"], { encoding: "utf8" }).trim();
+    expect(windowName(a.windowId)).toBe("project-a｜调查认证流程");
+    expect(windowName(b.windowId)).toBe("project-b｜检查任务队列");
+    expect(first.content[0]).toMatchObject({ type: "text", text: expect.stringContaining(`-t ${a.windowId}`) });
+    const option = (id: string, name: string) => execFileSync("tmux", ["show-options", "-w", "-t", id, name], { encoding: "utf8" }).trim();
+    expect(option(a.windowId, "remain-on-exit")).toBe("remain-on-exit on");
+    expect(option(a.windowId, "automatic-rename")).toBe("automatic-rename off");
+    execFileSync("tmux", ["kill-window", "-t", a.windowId]);
+    expect(windowName(b.windowId)).toBe("project-b｜检查任务队列");
+  } finally {
+    await h.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, h.ctx);
+    execFileSync("tmux", ["kill-session", "-t", a.session]);
+  }
+});
+
+test("delivers separate results only to the original session and ignores invalid messages", async () => {
+  const h = harness();
+  const first = await h.execute({ task: "Answer 1", title: "project｜回答一", piArgs: [] });
+  const second = await h.execute({ task: "Answer 2", title: "project｜回答二", piArgs: [] });
+  const a = first.details as { id: string; session: string; windowId: string };
+  const b = second.details as typeof a;
+  const { execFileSync } = await import("node:child_process");
+  const { readFileSync } = await import("node:fs");
+  const env = (windowId: string, key: string) => {
+    const pid = execFileSync("tmux", ["display-message", "-p", "-t", windowId, "#{pane_pid}"], { encoding: "utf8" }).trim();
+    const entry = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").find((part) => part.startsWith(`${key}=`));
+    return entry!.slice(key.length + 1);
+  };
+  const socket = env(a.windowId, "PI_SUBAGENT_SOCKET");
+  const tokenA = env(a.windowId, "PI_SUBAGENT_TOKEN");
+  const tokenB = env(b.windowId, "PI_SUBAGENT_TOKEN");
   expect(a.id).not.toBe(b.id);
   const report = (body: object) => new Promise<void>((resolve, reject) => {
     const s = connect(socket);
@@ -68,12 +113,12 @@ test("delivers separate results only to the original session and ignores invalid
   await report({ id: a.id, token: tokenA, text: "first" });
   expect(h.sendMessage.mock.calls.map(([msg]) => msg.content)).toEqual([expect.stringContaining("second"), expect.stringContaining("first")]);
   expect(h.sendMessage.mock.calls.every(([, options]) => options.triggerTurn && options.deliverAs === "followUp")).toBe(true);
-  const pending = await h.execute({ task: "Answer 3", piArgs: [] });
+  const pending = await h.execute({ task: "Answer 3", title: "project｜回答三", piArgs: [] });
   const c = pending.details as typeof a;
-  const tokenC = env(c.session, "PI_SUBAGENT_TOKEN");
+  const tokenC = env(c.windowId, "PI_SUBAGENT_TOKEN");
   h.setSession("another");
   await report({ id: c.id, token: tokenC, text: "must not be delivered" });
   expect(h.sendMessage).toHaveBeenCalledTimes(2);
   await h.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, h.ctx);
-  for (const session of [a.session, b.session, c.session]) execFileSync("tmux", ["kill-session", "-t", session]);
+  execFileSync("tmux", ["kill-session", "-t", a.session]);
 });
