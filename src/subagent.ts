@@ -121,8 +121,9 @@ export default function subagent(pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _update, ctx) {
       const args = argsForChild(params.piArgs);
+      if (/[\x00-\x1f\x7f]/.test(params.title)) throw new Error("title must be 1–80 characters without control characters");
       const title = params.title.trim();
-      if (!title || [...title].length > 80 || /[\x00-\x1f\x7f]/.test(title)) throw new Error("title must be 1–80 characters without control characters");
+      if (!title || [...title].length > 80) throw new Error("title must be 1–80 characters without control characters");
       const cwd = params.cwd ?? ctx.cwd;
       if (!statSync(cwd).isDirectory()) throw new Error(`Not a directory: ${cwd}`);
       const socketPath = (await listen(ctx)) ?? join(socketDir!, "reply.sock");
@@ -133,20 +134,24 @@ export default function subagent(pi: ExtensionAPI) {
       const channel = `pi-subagent-ready-${id}`;
       const command = `tmux wait-for ${shellQuote(channel)}; exec pi ${[...args, "--name", title, "--extension", extensionPath, "--", params.task].map(shellQuote).join(" ")}`;
       const environment = ["-e", `PI_SUBAGENT_ID=${id}`, "-e", `PI_SUBAGENT_TOKEN=${token}`, "-e", `PI_SUBAGENT_SOCKET=${socketPath}`];
-      let windowId: string;
+      let windowId = "";
       try {
         const createWindow = () => exec("tmux", ["new-window", "-d", "-P", "-F", "#{window_id}", "-t", `${session}:`, "-n", title, "-c", cwd, ...environment, command]);
-        if ((await exec("tmux", ["has-session", "-t", `=${session}`]).then(() => true, () => false))) {
-          windowId = (await createWindow()).stdout.trim();
-        } else {
+        const sessionExists = () => exec("tmux", ["has-session", "-t", `=${session}`]).then(() => true, () => false);
+        let created = false;
+        for (let attempt = 0; attempt < 3 && !created; attempt++) {
+          const exists = await sessionExists();
           try {
-            windowId = (await exec("tmux", ["new-session", "-d", "-P", "-F", "#{window_id}", "-s", session, "-n", title, "-c", cwd, ...environment, command])).stdout.trim();
+            windowId = exists
+              ? (await createWindow()).stdout.trim()
+              : (await exec("tmux", ["new-session", "-d", "-P", "-F", "#{window_id}", "-s", session, "-n", title, "-c", cwd, ...environment, command])).stdout.trim();
+            created = true;
           } catch (error) {
-            // Another main Pi may have created the shared session concurrently.
-            await exec("tmux", ["has-session", "-t", `=${session}`]);
-            windowId = (await createWindow()).stdout.trim();
+            // The shared session may appear or disappear between the check and creation.
+            if (exists === await sessionExists() || attempt === 2) throw error;
           }
         }
+        if (!created || !windowId) throw new Error("Could not create a subagent window");
         try {
           await exec("tmux", ["set-option", "-w", "-t", windowId, "remain-on-exit", "on"]);
           await exec("tmux", ["set-option", "-w", "-t", windowId, "automatic-rename", "off"]);

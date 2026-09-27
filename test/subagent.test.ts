@@ -1,5 +1,5 @@
 import { afterAll, afterEach, expect, test, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect } from "node:net";
@@ -8,12 +8,19 @@ import extension from "../src/subagent.js";
 
 // Isolate the tmux server: tests must never remove a user's shared session.
 const previousTmux = process.env.TMUX;
+const previousPath = process.env.PATH;
+const bin = mkdtempSync(join(tmpdir(), "subagent-bin-"));
+writeFileSync(join(bin, "pi"), "#!/bin/sh\nexec sleep 60\n");
+chmodSync(join(bin, "pi"), 0o755);
+process.env.PATH = `${bin}:${previousPath}`;
 process.env.TMUX = join(tmpdir(), `tmux-${process.getuid!()}`, `subagent-test-${process.pid}-${Date.now()}`) + ",0,0";
 afterAll(async () => {
   const { execFileSync } = await import("node:child_process");
   try { execFileSync("tmux", ["kill-server"], { stdio: "ignore" }); } catch { /* No server if all calls were rejected. */ }
   if (previousTmux === undefined) delete process.env.TMUX;
   else process.env.TMUX = previousTmux;
+  process.env.PATH = previousPath;
+  rmSync(bin, { recursive: true, force: true });
 });
 const dirs: string[] = [];
 function harness() {
@@ -50,6 +57,7 @@ test("rejects incompatible interactive options before creating a tmux session", 
   await expect(h.execute({ task: "hi", title: "project｜work", piArgs: ["--name", "other"] })).rejects.toThrow(/interactive/);
   await expect(h.execute({ task: "hi", title: "project｜work", piArgs: ["--name=other"] })).rejects.toThrow(/interactive/);
   await expect(h.execute({ task: "hi", title: "bad\ntitle", piArgs: [] })).rejects.toThrow(/title/);
+  await expect(h.execute({ task: "hi", title: "project｜work\n", piArgs: [] })).rejects.toThrow(/title/);
   for (const flag of ["--export", "--list-models", "--help", "--version", "--mode=json"]) {
     await expect(h.execute({ task: "hi", piArgs: [flag] })).rejects.toThrow(/interactive/);
   }
@@ -79,6 +87,12 @@ test("groups concurrent tasks in one named session with stable window IDs and ta
     expect(option(a.windowId, "automatic-rename")).toBe("automatic-rename off");
     execFileSync("tmux", ["kill-window", "-t", a.windowId]);
     expect(windowName(b.windowId)).toBe("project-b｜检查任务队列");
+    execFileSync("tmux", ["kill-window", "-t", b.windowId]);
+    const replacement = await h.execute({ task: "read docs", title: "project-c｜阅读文档", piArgs: [] });
+    const c = replacement.details as typeof a;
+    expect(c.session).toBe(a.session);
+    expect(c.windowId).not.toBe(b.windowId);
+    expect(windowName(c.windowId)).toBe("project-c｜阅读文档");
   } finally {
     await h.handlers.get("session_shutdown")!({ type: "session_shutdown", reason: "quit" }, h.ctx);
     execFileSync("tmux", ["kill-session", "-t", a.session]);
