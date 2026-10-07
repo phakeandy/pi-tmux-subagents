@@ -1,0 +1,20 @@
+import { expect, test, vi } from "vitest";
+import { resultCard } from "../src/result-card.js";
+import type { Theme } from "@earendil-works/pi-coding-agent";
+import type { TuiMouseEvent } from "@earendil-works/pi-tui";
+const theme = { fg: (_color: string, text: string) => text, bg: (_color: string, text: string) => text } as unknown as Theme;
+const click: TuiMouseEvent = { type: "click", button: "left", x: 1, y: 1, screenX: 1, screenY: 1, width: 100, height: 5, shift: false, alt: false, ctrl: false };
+test("left click on the result card navigates once, while dragging and scrolling are preserved", async () => {
+  let finish!: () => void;
+  const open = vi.fn(() => new Promise<void>(resolve => { finish = resolve; }));
+  const card = resultCard("old content", { title: "project｜work", text: "result" }, theme, 1, open, vi.fn());
+  expect(card.render(80).join("\n")).toContain("project｜work");
+  expect(card.handleMouse?.({ ...click, type: "drag" })).toBeUndefined();
+  expect(card.handleMouse?.({ ...click, type: "wheel", wheelDelta: 1 })).toBeUndefined();
+  expect(open).not.toHaveBeenCalled();
+  expect(card.handleMouse?.(click)).toMatchObject({ handled: true });
+  card.handleMouse?.(click);
+  expect(open).toHaveBeenCalledTimes(1);
+  finish();
+  await Promise.resolve(); await Promise.resolve();
+});
